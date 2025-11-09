@@ -2,7 +2,7 @@
 // - Auth: NO AUTH (0x00)
 // - Command: CONNECT
 // - Address types: IPv4/IPv6/DOMAIN
-// - DNS: simple IPv4-only A-record resolver over UDP to 1.1.1.1
+// - DNS: simple IPv4-only A-record resolver over UDP (default 1.1.1.1, override via ZEROSOCKS_DNS_SERVER)
 //
 // Build quickstart:
 //   cargo new socks5-monoio && cd socks5-monoio
@@ -13,7 +13,7 @@
 //   cargo run --release -- 0.0.0.0:1080
 //
 // Notes:
-// - The DNS client is intentionally minimal: it does one UDP query to 1.1.1.1,
+// - The DNS client is intentionally minimal: it does one UDP query (default to 1.1.1.1, override via ZEROSOCKS_DNS_SERVER),
 //   parses A records, and picks the first IPv4 address. No retries, no timeout,
 //   limited name compression handling (enough for typical answers).
 // - For production, add timeouts/retries, better parsing, CNAME chasing,
@@ -201,6 +201,8 @@ async fn handshake_and_proxy(mut inbound: TcpStream, ver_byte: u8) -> Result<()>
 
     let outbound_res: Result<TcpStream> = if let Some(addr) = target_sockaddr_opt {
         TcpStream::connect(addr).await
+    } else if let Ok(x) = target_host.as_ref().unwrap().parse::<Ipv4Addr>() {
+        TcpStream::connect(SocketAddrV4::new(x, port)).await
     } else {
         let host = target_host.unwrap();
         let ips = resolve_ipv4_a(&host).await?;
@@ -397,7 +399,7 @@ async fn reply(stream: &mut TcpStream, rep: u8, bnd: SocketAddr) -> Result<()> {
 // -------------------------------
 // Minimal IPv4-only DNS resolver
 // -------------------------------
-const DNS_SERVER: &str = "1.1.1.1:53";
+const DEFAULT_DNS_SERVER: &str = "1.1.1.1:53";
 
 async fn resolve_ipv4_a(domain: &str) -> Result<Vec<Ipv4Addr>> {
     // Build query
@@ -433,7 +435,9 @@ async fn resolve_ipv4_a(domain: &str) -> Result<Vec<Ipv4Addr>> {
 
     // Send/recv over UDP using monoio
     let sock = UdpSocket::bind("0.0.0.0:0")?;
-    let server: SocketAddr = DNS_SERVER
+    let server_addr =
+        env::var("ZEROSOCKS_DNS_SERVER").unwrap_or_else(|_| DEFAULT_DNS_SERVER.to_owned());
+    let server: SocketAddr = server_addr
         .parse()
         .map_err(|_| Error::new(ErrorKind::InvalidInput, "invalid DNS server address"))?;
     let (send_res, _) = sock.send_to(buf, server).await;
