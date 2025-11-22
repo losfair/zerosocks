@@ -26,7 +26,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use monoio::io::{AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, Splitable};
 use monoio::net::udp::UdpSocket;
-use monoio::net::{TcpListener, TcpStream};
+use monoio::net::{ListenerOpts, TcpListener, TcpStream};
 
 const SOCKS_VER: u8 = 0x05;
 
@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "0.0.0.0:1080".to_string());
     println!("[socks5] listening on {}", addr);
 
-    let listener = TcpListener::bind(addr)?;
+    let listener = TcpListener::bind_with_config(&addr, &ListenerOpts::new().reuse_port(true))?;
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
