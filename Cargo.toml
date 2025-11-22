@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 monoio = { version = "0.2", default-features = false, features = ["async-cancel", "iouring", "macros"] }
 libc = "0.2"
+socket2 = { version = "0.5", features = ["all"] }

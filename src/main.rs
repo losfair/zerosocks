@@ -52,6 +52,7 @@ struct Config {
     dns_server: SocketAddr,
     ipmap: HashMap<Option<IpAddr>, IpAddr>,
     deny_unmapped: bool,
+    tproxy: bool,
 }
 
 impl Config {
@@ -94,10 +95,13 @@ impl Config {
 
         let deny_unmapped = std::env::var("ZEROSOCKS_DENY_UNMAPPED").unwrap_or_default() == "1";
         println!("deny_unmapped: {}", deny_unmapped);
+        let tproxy = std::env::var("ZEROSOCKS_TPROXY").unwrap_or_default() == "1";
+        println!("tproxy: {}", tproxy);
         Self {
             dns_server,
             ipmap,
             deny_unmapped,
+            tproxy,
         }
     }
 
@@ -120,15 +124,66 @@ impl Config {
     }
 }
 
+fn bind_listener(addr: &str, opts: &ListenerOpts, transparent: bool) -> Result<TcpListener> {
+    if transparent {
+        return bind_tproxy_listener(addr, opts);
+    }
+    TcpListener::bind_with_config(addr, opts)
+}
+
+fn bind_tproxy_listener(addr: &str, opts: &ListenerOpts) -> Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::ToSocketAddrs;
+
+    let addr = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "empty listen address"))?;
+
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+
+    if opts.reuse_port {
+        socket.set_reuse_port(true)?;
+    }
+    if opts.reuse_addr {
+        socket.set_reuse_address(true)?;
+    }
+    if let Some(send_buf_size) = opts.send_buf_size {
+        socket.set_send_buffer_size(send_buf_size)?;
+    }
+    if let Some(recv_buf_size) = opts.recv_buf_size {
+        socket.set_recv_buffer_size(recv_buf_size)?;
+    }
+
+    socket.set_ip_transparent(true)?;
+
+    let sockaddr = socket2::SockAddr::from(addr);
+    socket.bind(&sockaddr)?;
+    socket.listen(opts.backlog)?;
+
+    let listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(listener)
+}
+
 #[monoio::main]
 async fn main() -> Result<()> {
     let config = &*Box::leak(Box::new(Config::from_env()));
     let addr = env::args()
         .nth(1)
         .unwrap_or_else(|| "0.0.0.0:1080".to_string());
-    println!("[socks5+redir] listening on {}", addr);
-
-    let listener = TcpListener::bind_with_config(&addr, &ListenerOpts::new().reuse_port(true))?;
+    let listener_opts = ListenerOpts::new().reuse_port(true);
+    let listener = bind_listener(&addr, &listener_opts, config.tproxy)?;
+    let mode = if config.tproxy {
+        "tproxy"
+    } else {
+        "socks5+redir"
+    };
+    println!("[{}] listening on {}", mode, addr);
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
@@ -152,6 +207,18 @@ async fn dispatch_client(
     mut inbound: TcpStream,
     peer: SocketAddr,
 ) -> Result<()> {
+    if config.tproxy {
+        let target = inbound.local_addr()?;
+        if target.ip().is_unspecified() {
+            let _ = inbound.shutdown().await;
+            return Err(Error::new(
+                ErrorKind::Other,
+                "missing original destination in TPROXY mode",
+            ));
+        }
+        return transparent_proxy(config, inbound, peer, target, Vec::new()).await;
+    }
+
     if let Some(target) = try_original_dst(&inbound)? {
         return transparent_proxy(config, inbound, peer, target, Vec::new()).await;
     }
@@ -314,7 +381,7 @@ async fn transparent_proxy(
     target: SocketAddr,
     initial_data: Vec<u8>,
 ) -> Result<()> {
-    println!("[redir] {} -> {}", peer, target);
+    println!("[transparent] {} -> {}", peer, target);
 
     let mut outbound = match config.connect(target).await {
         Ok(s) => s,
@@ -340,101 +407,60 @@ async fn transparent_proxy(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-const IP6T_SO_ORIGINAL_DST: libc::c_int = 80;
-
-#[cfg(target_os = "linux")]
 fn try_original_dst(stream: &TcpStream) -> Result<Option<SocketAddr>> {
-    use std::os::fd::AsRawFd;
+    use std::mem::ManuallyDrop;
+    use std::os::fd::{AsRawFd, FromRawFd};
 
-    unsafe {
-        let fd = stream.as_raw_fd();
-        let mut addr: libc::sockaddr_storage = std::mem::zeroed();
-        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    use socket2::{SockAddr, Socket};
 
-        let mut ret = libc::getsockopt(
-            fd,
-            libc::SOL_IP,
-            libc::SO_ORIGINAL_DST,
-            &mut addr as *mut _ as *mut _,
-            &mut len,
-        );
-
-        if ret != 0 {
-            let err = Error::last_os_error();
-            match err.raw_os_error() {
-                Some(code)
-                    if code == libc::ENOPROTOOPT
-                        || code == libc::EOPNOTSUPP
-                        || code == libc::EINVAL =>
-                {
-                    ret = libc::getsockopt(
-                        fd,
-                        libc::SOL_IPV6,
-                        IP6T_SO_ORIGINAL_DST,
-                        &mut addr as *mut _ as *mut _,
-                        &mut len,
-                    );
-                    if ret != 0 {
-                        let err = Error::last_os_error();
-                        match err.raw_os_error() {
-                            Some(code)
-                                if code == libc::ENOPROTOOPT
-                                    || code == libc::EOPNOTSUPP
-                                    || code == libc::ENOENT =>
-                            {
-                                return Ok(None);
-                            }
-                            _ => return Err(err),
-                        }
-                    }
-                }
-                Some(libc::ENOENT) => return Ok(None),
-                _ => return Err(err),
+    // Borrow the raw fd via socket2 without taking ownership of the descriptor.
+    let raw_fd = stream.as_raw_fd();
+    let socket = unsafe { ManuallyDrop::new(Socket::from_raw_fd(raw_fd)) };
+    let dst = match socket.original_dst() {
+        Ok(addr) => Ok(addr),
+        Err(err) => match err.raw_os_error() {
+            Some(code)
+                if code == libc::ENOPROTOOPT
+                    || code == libc::EOPNOTSUPP
+                    || code == libc::EINVAL =>
+            {
+                socket.original_dst_ipv6()
             }
-        }
+            Some(libc::ENOENT) => return Ok(None),
+            _ => Err(err),
+        },
+    };
 
-        let target = sockaddr_storage_to_addr(&addr)?;
-        let local = stream.local_addr()?;
-        if target == local {
-            Ok(None)
-        } else {
-            Ok(Some(target))
-        }
-    }
-}
+    let dst: SockAddr = match dst {
+        Ok(addr) => addr,
+        Err(err) => match err.raw_os_error() {
+            Some(code)
+                if code == libc::ENOPROTOOPT
+                    || code == libc::EOPNOTSUPP
+                    || code == libc::ENOENT =>
+            {
+                return Ok(None);
+            }
+            _ => return Err(err),
+        },
+    };
 
-#[cfg(target_os = "linux")]
-fn sockaddr_storage_to_addr(storage: &libc::sockaddr_storage) -> Result<SocketAddr> {
-    unsafe {
-        match storage.ss_family as i32 {
-            libc::AF_INET => {
-                let sin = *(storage as *const _ as *const libc::sockaddr_in);
-                let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                let port = u16::from_be(sin.sin_port);
-                Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
-            }
-            libc::AF_INET6 => {
-                let sin6 = *(storage as *const _ as *const libc::sockaddr_in6);
-                let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-                let port = u16::from_be(sin6.sin6_port);
-                let flowinfo = u32::from_be(sin6.sin6_flowinfo);
-                let scope_id = sin6.sin6_scope_id;
-                Ok(SocketAddr::V6(SocketAddrV6::new(
-                    ip, port, flowinfo, scope_id,
-                )))
-            }
-            _ => Err(Error::new(
+    let target = match dst.as_socket() {
+        Some(addr) => addr,
+        None => {
+            return Err(Error::new(
                 ErrorKind::Other,
                 "unsupported original destination address family",
-            )),
+            ));
         }
-    }
-}
+    };
 
-#[cfg(not(target_os = "linux"))]
-fn try_original_dst(_stream: &TcpStream) -> Result<Option<SocketAddr>> {
-    Ok(None)
+    let local = stream.local_addr()?;
+    if target == local {
+        Ok(None)
+    } else {
+        Ok(Some(target))
+    }
 }
 
 async fn reply(stream: &mut TcpStream, rep: u8, bnd: SocketAddr) -> Result<()> {
