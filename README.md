@@ -10,6 +10,20 @@ cargo run --release -- 0.0.0.0:1080
 
 The listener accepts plain SOCKS5 clients and Linux transparent redirect traffic on the same port. Redirected connections are detected via `SO_ORIGINAL_DST`.
 
+## Configuration
+
+- `ZEROSOCKS_DNS_SERVER`: DNS server for A-record lookups (default `1.1.1.1:53`).
+- `ZEROSOCKS_IPMAP_<NAME>=FROM->TO`: rewrite destination IPs before dialing (applies to SOCKS and transparent). Use `*` as `FROM` for a wildcard match.
+- `ZEROSOCKS_DENY_UNMAPPED=1`: reject connections that do not match any `ZEROSOCKS_IPMAP_*` rule.
+
+Example that rewrites one host and blocks anything else:
+
+```sh
+ZEROSOCKS_IPMAP_DB=203.0.113.10->10.0.0.10 \
+ZEROSOCKS_DENY_UNMAPPED=1 \
+cargo run --release -- 0.0.0.0:1080
+```
+
 ## Using iptables REDIRECT
 
 Transparent mode requires Linux with a kernel that supports `SO_ORIGINAL_DST` (most distributions). Redirect only the traffic you need and exclude the proxy process itself to avoid loops.

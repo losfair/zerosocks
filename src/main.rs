@@ -1,28 +1,9 @@
-// Simple single-file SOCKS5 (RFC 1928) proxy using monoio (io_uring)
-// - Auth: NO AUTH (0x00)
-// - Command: CONNECT
-// - Address types: IPv4/IPv6/DOMAIN
-// - DNS: simple IPv4-only A-record resolver over UDP (default 1.1.1.1, override via ZEROSOCKS_DNS_SERVER)
-//
-// Build quickstart:
-//   cargo new socks5-monoio && cd socks5-monoio
-//   # Replace src/main.rs with this file
-//   # Cargo.toml:
-//   # [dependencies]
-//   # monoio = { version = "0.2", features = ["macros", "net", "time"] }
-//   cargo run --release -- 0.0.0.0:1080
-//
-// Notes:
-// - The DNS client is intentionally minimal: it does one UDP query (default to 1.1.1.1, override via ZEROSOCKS_DNS_SERVER),
-//   parses A records, and picks the first IPv4 address. No retries, no timeout,
-//   limited name compression handling (enough for typical answers).
-// - For production, add timeouts/retries, better parsing, CNAME chasing,
-//   and more robust error handling.
-
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::env;
 use std::io::{Error, ErrorKind, Result};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::time::Duration;
 
 use monoio::io::{AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, Splitable};
 use monoio::net::udp::UdpSocket;
@@ -67,18 +48,91 @@ async fn write_all_buf(stream: &mut TcpStream, buf: Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+struct Config {
+    dns_server: SocketAddr,
+    ipmap: HashMap<Option<IpAddr>, IpAddr>,
+    deny_unmapped: bool,
+}
+
+impl Config {
+    fn from_env() -> Self {
+        let dns_server =
+            env::var("ZEROSOCKS_DNS_SERVER").unwrap_or_else(|_| "1.1.1.1:53".to_owned());
+        let dns_server: SocketAddr = dns_server.parse().expect("invalid ZEROSOCKS_DNS_SERVER");
+        println!("using dns server: {}", dns_server);
+
+        let mut ipmap = HashMap::new();
+
+        for (k, v) in std::env::vars() {
+            if let Some(k) = k.strip_prefix("ZEROSOCKS_IPMAP_") {
+                let Some((from, to)): Option<(Option<IpAddr>, IpAddr)> =
+                    v.split_once("->").and_then(|x| {
+                        Some((
+                            if x.0 == "*" {
+                                None
+                            } else {
+                                Some(x.0.parse().ok()?)
+                            },
+                            x.1.parse().ok()?,
+                        ))
+                    })
+                else {
+                    panic!("invalid ipmap '{}': expecting <from>-><to>", k);
+                };
+
+                let from = from.map(|x| x.to_canonical());
+                let to = to.to_canonical();
+                println!(
+                    "ipmap '{}': {}->{}",
+                    k,
+                    from.map(|x| x.to_string()).unwrap_or_else(|| "*".into()),
+                    to
+                );
+                ipmap.insert(from, to);
+            }
+        }
+
+        let deny_unmapped = std::env::var("ZEROSOCKS_DENY_UNMAPPED").unwrap_or_default() == "1";
+        println!("deny_unmapped: {}", deny_unmapped);
+        Self {
+            dns_server,
+            ipmap,
+            deny_unmapped,
+        }
+    }
+
+    async fn connect(&self, addr: SocketAddr) -> std::io::Result<TcpStream> {
+        let ip = addr.ip().to_canonical();
+        let ip = match self.ipmap.get(&Some(ip)) {
+            Some(x) => *x,
+            None => match self.ipmap.get(&None) {
+                Some(x) => *x,
+                None => {
+                    if self.deny_unmapped {
+                        return Err(std::io::ErrorKind::PermissionDenied.into());
+                    } else {
+                        ip
+                    }
+                }
+            },
+        };
+        TcpStream::connect(SocketAddr::new(ip, addr.port())).await
+    }
+}
+
 #[monoio::main]
 async fn main() -> Result<()> {
+    let config = &*Box::leak(Box::new(Config::from_env()));
     let addr = env::args()
         .nth(1)
         .unwrap_or_else(|| "0.0.0.0:1080".to_string());
-    println!("[socks5] listening on {}", addr);
+    println!("[socks5+redir] listening on {}", addr);
 
     let listener = TcpListener::bind_with_config(&addr, &ListenerOpts::new().reuse_port(true))?;
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                monoio::spawn(handle_client(stream, peer));
+                monoio::spawn(handle_client(config, stream, peer));
             }
             Err(e) => {
                 eprintln!("[socks5] accept error: {}", e);
@@ -87,15 +141,19 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle_client(inbound: TcpStream, peer: SocketAddr) {
-    if let Err(e) = dispatch_client(inbound, peer).await {
+async fn handle_client(config: &'static Config, inbound: TcpStream, peer: SocketAddr) {
+    if let Err(e) = dispatch_client(config, inbound, peer).await {
         eprintln!("[socks5] {} error: {}", peer, e);
     }
 }
 
-async fn dispatch_client(mut inbound: TcpStream, peer: SocketAddr) -> Result<()> {
+async fn dispatch_client(
+    config: &'static Config,
+    mut inbound: TcpStream,
+    peer: SocketAddr,
+) -> Result<()> {
     if let Some(target) = try_original_dst(&inbound)? {
-        return transparent_proxy(inbound, peer, target, Vec::new()).await;
+        return transparent_proxy(config, inbound, peer, target, Vec::new()).await;
     }
 
     let first_byte = match read_exact_array::<1>(&mut inbound).await {
@@ -118,10 +176,14 @@ async fn dispatch_client(mut inbound: TcpStream, peer: SocketAddr) -> Result<()>
         ));
     }
 
-    handshake_and_proxy(inbound, first_byte).await
+    handshake_and_proxy(config, inbound, first_byte).await
 }
 
-async fn handshake_and_proxy(mut inbound: TcpStream, ver_byte: u8) -> Result<()> {
+async fn handshake_and_proxy(
+    config: &'static Config,
+    mut inbound: TcpStream,
+    ver_byte: u8,
+) -> Result<()> {
     if ver_byte != SOCKS_VER {
         let _ = inbound.shutdown().await;
         return Err(Error::new(
@@ -200,18 +262,18 @@ async fn handshake_and_proxy(mut inbound: TcpStream, ver_byte: u8) -> Result<()>
     };
 
     let outbound_res: Result<TcpStream> = if let Some(addr) = target_sockaddr_opt {
-        TcpStream::connect(addr).await
+        config.connect(addr).await
     } else if let Ok(x) = target_host.as_ref().unwrap().parse::<Ipv4Addr>() {
-        TcpStream::connect(SocketAddrV4::new(x, port)).await
+        config.connect(SocketAddrV4::new(x, port).into()).await
     } else {
         let host = target_host.unwrap();
-        let ips = resolve_ipv4_a(&host).await?;
+        let ips = resolve_ipv4_a(config, &host).await?;
         let ip = ips
             .into_iter()
             .next()
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "no A records"))?;
         let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
-        TcpStream::connect(addr).await
+        config.connect(addr).await
     };
 
     let outbound = match outbound_res {
@@ -246,6 +308,7 @@ async fn handshake_and_proxy(mut inbound: TcpStream, ver_byte: u8) -> Result<()>
 }
 
 async fn transparent_proxy(
+    config: &'static Config,
     mut inbound: TcpStream,
     peer: SocketAddr,
     target: SocketAddr,
@@ -253,7 +316,7 @@ async fn transparent_proxy(
 ) -> Result<()> {
     println!("[redir] {} -> {}", peer, target);
 
-    let mut outbound = match TcpStream::connect(target).await {
+    let mut outbound = match config.connect(target).await {
         Ok(s) => s,
         Err(e) => {
             let _ = inbound.shutdown().await;
@@ -399,9 +462,7 @@ async fn reply(stream: &mut TcpStream, rep: u8, bnd: SocketAddr) -> Result<()> {
 // -------------------------------
 // Minimal IPv4-only DNS resolver
 // -------------------------------
-const DEFAULT_DNS_SERVER: &str = "1.1.1.1:53";
-
-async fn resolve_ipv4_a(domain: &str) -> Result<Vec<Ipv4Addr>> {
+async fn resolve_ipv4_a(config: &'static Config, domain: &str) -> Result<Vec<Ipv4Addr>> {
     // Build query
     // Header: ID(2) FLAGS(2) QDCOUNT(2) ANCOUNT(2) NSCOUNT(2) ARCOUNT(2)
     let id: u16 = 0x1234; // static id is fine for a simple single-query resolver
@@ -434,17 +495,16 @@ async fn resolve_ipv4_a(domain: &str) -> Result<Vec<Ipv4Addr>> {
     buf.extend_from_slice(&1u16.to_be_bytes());
 
     // Send/recv over UDP using monoio
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
-    let server_addr =
-        env::var("ZEROSOCKS_DNS_SERVER").unwrap_or_else(|_| DEFAULT_DNS_SERVER.to_owned());
-    let server: SocketAddr = server_addr
-        .parse()
-        .map_err(|_| Error::new(ErrorKind::InvalidInput, "invalid DNS server address"))?;
-    let (send_res, _) = sock.send_to(buf, server).await;
+    let sock = UdpSocket::bind("[::]:0")?;
+    let (send_res, _) = sock.send_to(buf, config.dns_server).await;
     send_res?;
 
     let resp_buf = vec![0u8; 512];
-    let (recv_res, mut resp) = sock.recv_from(resp_buf).await;
+    let (recv_res, mut resp) =
+        match monoio::time::timeout(Duration::from_secs(5), sock.recv_from(resp_buf)).await {
+            Ok(x) => x,
+            Err(_) => return Err(std::io::ErrorKind::TimedOut.into()),
+        };
     let (n, _) = recv_res?;
     resp.truncate(n);
 
