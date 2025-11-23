@@ -1,3 +1,5 @@
+mod async_print;
+
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::env;
@@ -5,6 +7,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
 
+use monoio::IoUringDriver;
 use monoio::io::{AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, Splitable};
 use monoio::net::udp::UdpSocket;
 use monoio::net::{ListenerOpts, TcpListener, TcpStream};
@@ -170,8 +173,15 @@ fn bind_tproxy_listener(addr: &str, opts: &ListenerOpts) -> Result<TcpListener> 
     TcpListener::from_std(listener)
 }
 
-#[monoio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    monoio::RuntimeBuilder::<IoUringDriver>::new()
+        .enable_timer()
+        .build()
+        .expect("zerosocks: failed to build io_uring runtime")
+        .block_on(amain())
+}
+
+async fn amain() -> Result<()> {
     let config = &*Box::leak(Box::new(Config::from_env()));
     let addr = env::args()
         .nth(1)
@@ -183,22 +193,27 @@ async fn main() -> Result<()> {
     } else {
         "socks5+redir"
     };
-    println!("[{}] listening on {}", mode, addr);
+    aeprintln!("[{}] listening on {}", mode, addr);
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                monoio::spawn(handle_client(config, stream, peer));
+                monoio::spawn(handle_client(config, mode, stream, peer));
             }
             Err(e) => {
-                eprintln!("[socks5] accept error: {}", e);
+                aeprintln!("[socks5] accept error: {}", e);
             }
         }
     }
 }
 
-async fn handle_client(config: &'static Config, inbound: TcpStream, peer: SocketAddr) {
+async fn handle_client(
+    config: &'static Config,
+    mode: &'static str,
+    inbound: TcpStream,
+    peer: SocketAddr,
+) {
     if let Err(e) = dispatch_client(config, inbound, peer).await {
-        eprintln!("[socks5] {} error: {}", peer, e);
+        aeprintln!("[{}] {} error: {}", mode, peer, e);
     }
 }
 
@@ -381,7 +396,7 @@ async fn transparent_proxy(
     target: SocketAddr,
     initial_data: Vec<u8>,
 ) -> Result<()> {
-    println!("[transparent] {} -> {}", peer, target);
+    aeprintln!("[transparent] {} -> {}", peer, target);
 
     let mut outbound = match config.connect(target).await {
         Ok(s) => s,
