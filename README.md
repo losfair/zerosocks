@@ -8,6 +8,12 @@ Simple `io_uring` SOCKS5 server with optional transparent TCP proxying for iptab
 cargo run --release -- 0.0.0.0:1080
 ```
 
+To enter another process' network namespace for outbound connections (after binding the listener):
+
+```sh
+ZEROSOCKS_NETNS_PID=1234 cargo run --release -- 0.0.0.0:1080
+```
+
 The listener accepts plain SOCKS5 clients and Linux transparent redirect traffic on the same port. Redirected connections are detected via `SO_ORIGINAL_DST`. In TPROXY mode (`ZEROSOCKS_TPROXY=1`), the listener uses `IP_TRANSPARENT` and only handles redirected traffic (no SOCKS5 handshake).
 
 ## Configuration
@@ -16,6 +22,7 @@ The listener accepts plain SOCKS5 clients and Linux transparent redirect traffic
 - `ZEROSOCKS_IPMAP_<NAME>=FROM->TO`: rewrite destination IPs before dialing (applies to SOCKS and transparent). Use `*` as `FROM` for a wildcard match.
 - `ZEROSOCKS_DENY_UNMAPPED=1`: reject connections that do not match any `ZEROSOCKS_IPMAP_*` rule.
 - `ZEROSOCKS_TPROXY=1`: bind with `IP_TRANSPARENT` and expect `-j TPROXY` traffic (Linux only). Disables SOCKS5 serving.
+- `ZEROSOCKS_FWMARK`: set `SO_MARK` on outbound sockets (accepts decimal or `0x` hex values).
 
 Example that rewrites one host and blocks anything else:
 

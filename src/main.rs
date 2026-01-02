@@ -56,6 +56,96 @@ struct Config {
     ipmap: HashMap<Option<IpAddr>, IpAddr>,
     deny_unmapped: bool,
     tproxy: bool,
+    fwmark: Option<u32>,
+}
+
+fn parse_fwmark_value(value: &str) -> Result<u32> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidInput, "empty fwmark"));
+    }
+    let (value, radix) = if let Some(hex) = value.strip_prefix("0x") {
+        (hex, 16)
+    } else if let Some(hex) = value.strip_prefix("0X") {
+        (hex, 16)
+    } else {
+        (value, 10)
+    };
+    u32::from_str_radix(value, radix)
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "invalid fwmark value"))
+}
+
+fn set_socket_fwmark<T: std::os::fd::AsRawFd>(socket: &T, mark: u32) -> Result<()> {
+    let mark = mark as libc::c_uint;
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            &mark as *const libc::c_uint as *const libc::c_void,
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn check_socket_error<T: std::os::fd::AsRawFd>(socket: &T) -> Result<()> {
+    let mut err: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut err as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(Error::last_os_error());
+    }
+    if err != 0 {
+        return Err(Error::from_raw_os_error(err));
+    }
+    Ok(())
+}
+
+async fn connect_with_fwmark(addr: SocketAddr, fwmark: u32) -> Result<TcpStream> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_nonblocking(true)?;
+    set_socket_fwmark(&socket, fwmark)?;
+    let sockaddr = socket2::SockAddr::from(addr);
+
+    let mut pending = false;
+    match socket.connect(&sockaddr) {
+        Ok(()) => {}
+        Err(err) => match err.raw_os_error() {
+            Some(code) if code == libc::EINPROGRESS || code == libc::EALREADY => {
+                pending = true;
+            }
+            _ => return Err(err),
+        },
+    }
+
+    let std_stream: std::net::TcpStream = socket.into();
+    let stream = TcpStream::from_std(std_stream)?;
+
+    if pending {
+        stream.writable(true).await?;
+        check_socket_error(&stream)?;
+    }
+
+    Ok(stream)
 }
 
 impl Config {
@@ -100,11 +190,21 @@ impl Config {
         println!("deny_unmapped: {}", deny_unmapped);
         let tproxy = std::env::var("ZEROSOCKS_TPROXY").unwrap_or_default() == "1";
         println!("tproxy: {}", tproxy);
+        let fwmark = std::env::var("ZEROSOCKS_FWMARK")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| parse_fwmark_value(&value).expect("invalid ZEROSOCKS_FWMARK"));
+        if let Some(mark) = fwmark.as_ref() {
+            println!("fwmark: {:#x}", mark);
+        } else {
+            println!("fwmark: none");
+        }
         Self {
             dns_server,
             ipmap,
             deny_unmapped,
             tproxy,
+            fwmark,
         }
     }
 
@@ -123,8 +223,25 @@ impl Config {
                 }
             },
         };
-        TcpStream::connect(SocketAddr::new(ip, addr.port())).await
+        let target = SocketAddr::new(ip, addr.port());
+        match self.fwmark {
+            Some(mark) => connect_with_fwmark(target, mark).await,
+            None => TcpStream::connect(target).await,
+        }
     }
+}
+
+fn enter_netns(pid: i32) -> Result<()> {
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+
+    let path = format!("/proc/{}/ns/net", pid);
+    let file = File::open(&path)?;
+    let rc = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) };
+    if rc != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn bind_listener(addr: &str, opts: &ListenerOpts, transparent: bool) -> Result<TcpListener> {
@@ -188,6 +305,18 @@ async fn amain() -> Result<()> {
         .unwrap_or_else(|| "0.0.0.0:1080".to_string());
     let listener_opts = ListenerOpts::new().reuse_port(true);
     let listener = bind_listener(&addr, &listener_opts, config.tproxy)?;
+    if let Ok(pid_str) = env::var("ZEROSOCKS_NETNS_PID") {
+        let pid: i32 = pid_str
+            .parse()
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "invalid ZEROSOCKS_NETNS_PID"))?;
+        if pid <= 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid ZEROSOCKS_NETNS_PID",
+            ));
+        }
+        enter_netns(pid)?;
+    }
     let mode = if config.tproxy {
         "tproxy"
     } else {
@@ -537,6 +666,9 @@ async fn resolve_ipv4_a(config: &'static Config, domain: &str) -> Result<Vec<Ipv
 
     // Send/recv over UDP using monoio
     let sock = UdpSocket::bind("[::]:0")?;
+    if let Some(mark) = config.fwmark {
+        set_socket_fwmark(&sock, mark)?;
+    }
     let (send_res, _) = sock.send_to(buf, config.dns_server).await;
     send_res?;
 
