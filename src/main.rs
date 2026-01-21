@@ -57,6 +57,8 @@ struct Config {
     deny_unmapped: bool,
     tproxy: bool,
     fwmark: Option<u32>,
+    socks5_upstream: Option<SocketAddr>,
+    socks5_upstream_auth: Option<(String, String)>,
 }
 
 fn parse_fwmark_value(value: &str) -> Result<u32> {
@@ -148,6 +150,164 @@ async fn connect_with_fwmark(addr: SocketAddr, fwmark: u32) -> Result<TcpStream>
     Ok(stream)
 }
 
+const AUTH_NONE: u8 = 0x00;
+const AUTH_USERNAME_PASSWORD: u8 = 0x02;
+const AUTH_NO_ACCEPTABLE: u8 = 0xFF;
+
+async fn connect_via_socks5(
+    proxy: SocketAddr,
+    target: SocketAddr,
+    fwmark: Option<u32>,
+    auth: Option<&(String, String)>,
+) -> Result<TcpStream> {
+    // Connect to SOCKS5 proxy
+    let mut stream = match fwmark {
+        Some(mark) => connect_with_fwmark(proxy, mark).await?,
+        None => TcpStream::connect(proxy).await?,
+    };
+
+    // SOCKS5 greeting: version(1) + nmethods(1) + methods(nmethods)
+    // Offer both no-auth (0x00) and username/password (0x02) if we have credentials
+    let greeting = if auth.is_some() {
+        vec![SOCKS_VER, 0x02, AUTH_NONE, AUTH_USERNAME_PASSWORD]
+    } else {
+        vec![SOCKS_VER, 0x01, AUTH_NONE]
+    };
+    write_all_buf(&mut stream, greeting).await?;
+
+    // Read auth response: version(1) + method(1)
+    let auth_resp = read_exact_array::<2>(&mut stream).await?;
+    if auth_resp[0] != SOCKS_VER {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "upstream proxy returned invalid SOCKS version",
+        ));
+    }
+    let selected_method = auth_resp[1];
+    match selected_method {
+        AUTH_NONE => {
+            // No authentication required, proceed
+        }
+        AUTH_USERNAME_PASSWORD => {
+            // Perform username/password authentication (RFC 1929)
+            let (username, password) = auth.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::PermissionDenied,
+                    "upstream proxy requires authentication but no credentials provided",
+                )
+            })?;
+            if username.len() > 255 || password.len() > 255 {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "username or password too long (max 255 bytes)",
+                ));
+            }
+            // VER(1) + ULEN(1) + UNAME(ULEN) + PLEN(1) + PASSWD(PLEN)
+            let mut auth_req = Vec::with_capacity(3 + username.len() + password.len());
+            auth_req.push(0x01); // auth subnegotiation version
+            auth_req.push(username.len() as u8);
+            auth_req.extend_from_slice(username.as_bytes());
+            auth_req.push(password.len() as u8);
+            auth_req.extend_from_slice(password.as_bytes());
+            write_all_buf(&mut stream, auth_req).await?;
+
+            // Read auth result: VER(1) + STATUS(1)
+            let auth_result = read_exact_array::<2>(&mut stream).await?;
+            if auth_result[1] != 0x00 {
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    "upstream proxy authentication failed",
+                ));
+            }
+        }
+        AUTH_NO_ACCEPTABLE => {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "upstream proxy rejected all authentication methods",
+            ));
+        }
+        _ => {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "upstream proxy selected unsupported auth method: {:#x}",
+                    selected_method
+                ),
+            ));
+        }
+    }
+
+    // Send CONNECT request: version(1) + cmd(1) + rsv(1) + atyp(1) + addr + port(2)
+    let mut req = Vec::with_capacity(4 + 16 + 2);
+    req.push(SOCKS_VER);
+    req.push(CMD_CONNECT);
+    req.push(0x00); // reserved
+    match target {
+        SocketAddr::V4(v4) => {
+            req.push(ATYP_IPV4);
+            req.extend_from_slice(&v4.ip().octets());
+            req.extend_from_slice(&v4.port().to_be_bytes());
+        }
+        SocketAddr::V6(v6) => {
+            req.push(ATYP_IPV6);
+            req.extend_from_slice(&v6.ip().octets());
+            req.extend_from_slice(&v6.port().to_be_bytes());
+        }
+    }
+    write_all_buf(&mut stream, req).await?;
+
+    // Read reply header: version(1) + rep(1) + rsv(1) + atyp(1)
+    let reply_hdr = read_exact_array::<4>(&mut stream).await?;
+    if reply_hdr[0] != SOCKS_VER {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "upstream proxy returned invalid SOCKS version in reply",
+        ));
+    }
+    let rep = reply_hdr[1];
+    if rep != REP_SUCCEEDED {
+        let msg = match rep {
+            REP_GENERAL_FAILURE => "general failure",
+            REP_NETWORK_UNREACHABLE => "network unreachable",
+            REP_HOST_UNREACHABLE => "host unreachable",
+            REP_CONN_REFUSED => "connection refused",
+            REP_CMD_NOT_SUPPORTED => "command not supported",
+            REP_ATYP_NOT_SUPPORTED => "address type not supported",
+            _ => "unknown error",
+        };
+        let kind = match rep {
+            REP_CONN_REFUSED => ErrorKind::ConnectionRefused,
+            REP_NETWORK_UNREACHABLE => ErrorKind::AddrNotAvailable,
+            REP_HOST_UNREACHABLE => ErrorKind::NotFound,
+            _ => ErrorKind::Other,
+        };
+        return Err(Error::new(kind, format!("upstream proxy: {}", msg)));
+    }
+
+    // Skip BND.ADDR and BND.PORT based on atyp
+    let atyp = reply_hdr[3];
+    match atyp {
+        ATYP_IPV4 => {
+            let _ = read_exact_array::<6>(&mut stream).await?; // 4 bytes IP + 2 bytes port
+        }
+        ATYP_IPV6 => {
+            let _ = read_exact_array::<18>(&mut stream).await?; // 16 bytes IP + 2 bytes port
+        }
+        ATYP_DOMAIN => {
+            let len = read_exact_array::<1>(&mut stream).await?[0] as usize;
+            let _ = read_exact_vec(&mut stream, len + 2).await?; // domain + 2 bytes port
+        }
+        _ => {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "upstream proxy returned unsupported address type",
+            ));
+        }
+    }
+
+    Ok(stream)
+}
+
 impl Config {
     fn from_env() -> Self {
         let dns_server =
@@ -199,12 +359,39 @@ impl Config {
         } else {
             println!("fwmark: none");
         }
+        let socks5_upstream = std::env::var("ZEROSOCKS_SOCKS5_UPSTREAM")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value
+                    .parse()
+                    .expect("invalid ZEROSOCKS_SOCKS5_UPSTREAM (expected host:port)")
+            });
+        if let Some(upstream) = socks5_upstream.as_ref() {
+            println!("socks5 upstream: {}", upstream);
+        } else {
+            println!("socks5 upstream: none");
+        }
+        let socks5_upstream_auth = std::env::var("ZEROSOCKS_SOCKS5_USERNAME")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|username| {
+                let password = std::env::var("ZEROSOCKS_SOCKS5_PASSWORD").unwrap_or_default();
+                (username, password)
+            });
+        if socks5_upstream_auth.is_some() {
+            println!("socks5 upstream auth: enabled");
+        } else {
+            println!("socks5 upstream auth: none");
+        }
         Self {
             dns_server,
             ipmap,
             deny_unmapped,
             tproxy,
             fwmark,
+            socks5_upstream,
+            socks5_upstream_auth,
         }
     }
 
@@ -224,6 +411,10 @@ impl Config {
             },
         };
         let target = SocketAddr::new(ip, addr.port());
+        if let Some(proxy) = self.socks5_upstream {
+            return connect_via_socks5(proxy, target, self.fwmark, self.socks5_upstream_auth.as_ref())
+                .await;
+        }
         match self.fwmark {
             Some(mark) => connect_with_fwmark(target, mark).await,
             None => TcpStream::connect(target).await,

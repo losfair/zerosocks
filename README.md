@@ -23,6 +23,9 @@ The listener accepts plain SOCKS5 clients and Linux transparent redirect traffic
 - `ZEROSOCKS_DENY_UNMAPPED=1`: reject connections that do not match any `ZEROSOCKS_IPMAP_*` rule.
 - `ZEROSOCKS_TPROXY=1`: bind with `IP_TRANSPARENT` and expect `-j TPROXY` traffic (Linux only). Disables SOCKS5 serving.
 - `ZEROSOCKS_FWMARK`: set `SO_MARK` on outbound sockets (accepts decimal or `0x` hex values).
+- `ZEROSOCKS_SOCKS5_UPSTREAM`: route all outbound connections through an upstream SOCKS5 proxy (e.g., `192.168.1.1:1080`).
+- `ZEROSOCKS_SOCKS5_USERNAME`: username for upstream SOCKS5 proxy authentication.
+- `ZEROSOCKS_SOCKS5_PASSWORD`: password for upstream SOCKS5 proxy authentication.
 
 Example that rewrites one host and blocks anything else:
 
