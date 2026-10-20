@@ -8,11 +8,16 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV
 use std::time::Duration;
 
 use monoio::IoUringDriver;
-use monoio::io::{AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, Splitable};
+use monoio::io::{AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, Splitable};
 use monoio::net::udp::UdpSocket;
 use monoio::net::{ListenerOpts, TcpListener, TcpStream};
 
 const SOCKS_VER: u8 = 0x05;
+
+const RELAY_BUF_SIZE: usize = 64 * 1024;
+const KEEPALIVE_TIME: Duration = Duration::from_secs(60);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_RETRIES: u32 = 6;
 
 const CMD_CONNECT: u8 = 0x01;
 // const CMD_BIND: u8 = 0x02;
@@ -698,15 +703,7 @@ async fn handshake_and_proxy(
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
     reply(&mut inbound, REP_SUCCEEDED, bnd).await?;
 
-    let (mut ri, mut wi) = inbound.into_split();
-    let (mut ro, mut wo) = outbound.into_split();
-
-    monoio::select! {
-        _ = monoio::io::copy(&mut ri, &mut wo) => {}
-        _ = monoio::io::copy(&mut ro, &mut wi) => {}
-    }
-
-    Ok(())
+    relay(inbound, outbound).await
 }
 
 async fn transparent_proxy(
@@ -731,15 +728,53 @@ async fn transparent_proxy(
         res?;
     }
 
+    relay(inbound, outbound).await
+}
+
+/// Relays both directions until each side has closed its write half.
+/// EOF from one side is forwarded as a FIN (half-close) to the other, so
+/// request/response protocols that shut down their write side keep working.
+/// An error in either direction tears down the whole connection.
+async fn relay(inbound: TcpStream, outbound: TcpStream) -> Result<()> {
+    for s in [&inbound, &outbound] {
+        let _ = s.set_tcp_keepalive(
+            Some(KEEPALIVE_TIME),
+            Some(KEEPALIVE_INTERVAL),
+            Some(KEEPALIVE_RETRIES),
+        );
+    }
+
     let (mut ri, mut wi) = inbound.into_split();
     let (mut ro, mut wo) = outbound.into_split();
 
-    monoio::select! {
-        _ = monoio::io::copy(&mut ri, &mut wo) => {}
-        _ = monoio::io::copy(&mut ro, &mut wi) => {}
-    }
+    let mut up = std::pin::pin!(pipe(&mut ri, &mut wo));
+    let mut down = std::pin::pin!(pipe(&mut ro, &mut wi));
 
-    Ok(())
+    monoio::select! {
+        r = &mut up => { r?; down.await }
+        r = &mut down => { r?; up.await }
+    }
+}
+
+async fn pipe<R: AsyncReadRent, W: AsyncWriteRent>(reader: &mut R, writer: &mut W) -> Result<()> {
+    let mut buf: Vec<u8> = Vec::with_capacity(RELAY_BUF_SIZE);
+    loop {
+        let (res, b) = reader.read(buf).await;
+        match res {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => {
+                buf = b;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+        let (res, mut b) = writer.write_all(b).await;
+        res?;
+        b.clear();
+        buf = b;
+    }
+    writer.shutdown().await
 }
 
 fn try_original_dst(stream: &TcpStream) -> Result<Option<SocketAddr>> {
